@@ -7,6 +7,21 @@ import torch
 import numpy as np
 import pickle
 from pathlib import Path
+# tqdm is optional; provide a lightweight fallback when it's not installed
+try:
+  from tqdm import tqdm, trange
+except Exception:
+  def tqdm(iterable, **kwargs):
+    class Dummy:
+      def __init__(self, it):
+        self._it = it
+      def __iter__(self):
+        return iter(self._it)
+      def set_postfix(self, *a, **k):
+        return None
+    return Dummy(iterable)
+  def trange(*args, **kwargs):
+    return range(*args)
 
 from evaluation.evaluation import eval_edge_prediction
 from model.tgn import TGN
@@ -44,7 +59,7 @@ parser.add_argument('--message_function', type=str, default="identity", choices=
 parser.add_argument('--memory_updater', type=str, default="gru", choices=[
   "gru", "rnn"], help='Type of memory updater')
 parser.add_argument('--aggregator', type=str, default="last", help='Type of message '
-                                                                        'aggregator')
+                                                                        'aggregator : last, mean, temporal_weighted_mean, lstm, gat')
 parser.add_argument('--memory_update_at_end', action='store_true',
                     help='Whether to update memory at the end or at the start of the batch')
 parser.add_argument('--message_dim', type=int, default=100, help='Dimensions of the messages')
@@ -88,7 +103,15 @@ MEMORY_DIM = args.memory_dim
 
 Path("./saved_models/").mkdir(parents=True, exist_ok=True)
 Path("./saved_checkpoints/").mkdir(parents=True, exist_ok=True)
-MODEL_SAVE_PATH = f'./saved_models/{args.prefix}-{args.data}.pth'
+# create a timestamped subfolder to store this run's models
+TIMESTAMP = time.strftime("%Y%m%d-%H%M%S")
+MODEL_DIR = Path(f'./saved_models/{TIMESTAMP}')
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_SAVE_PATH = str(MODEL_DIR / f'{args.prefix}-{args.data}.pth')
+
+# also create a timestamped subfolder for checkpoints (optional / convenient)
+CHECKPOINT_DIR = Path(f'./saved_checkpoints/{TIMESTAMP}')
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 get_checkpoint_path = lambda \
     epoch: f'./saved_checkpoints/{args.prefix}-{args.data}-{epoch}.pth'
 
@@ -132,8 +155,31 @@ nn_test_rand_sampler = RandEdgeSampler(new_node_test_data.sources,
                                        seed=3)
 
 # Set device
-device_string = 'cuda:{}'.format(GPU) if torch.cuda.is_available() else 'cpu'
-device = torch.device(device_string)
+# If the user requested a GPU (non-negative index), enforce that CUDA is available and the
+# requested index is valid. Use CPU only when --gpu is set to a negative value.
+if GPU is not None and int(GPU) >= 0:
+  if not torch.cuda.is_available():
+    logger.error(f'GPU requested (index={GPU}) but CUDA is not available. Exiting.')
+    sys.exit(1)
+  available_gpus = torch.cuda.device_count()
+  if int(GPU) >= available_gpus:
+    logger.error(f'Requested GPU index {GPU} but only {available_gpus} GPUs are available. Exiting.')
+    sys.exit(1)
+  try:
+    torch.cuda.set_device(int(GPU))
+  except Exception as e:
+    logger.warning(f'Unable to set CUDA device to {GPU}: {e}')
+  device_string = f'cuda:{GPU}'
+  device = torch.device(device_string)
+  try:
+    gpu_name = torch.cuda.get_device_name(int(GPU))
+  except Exception:
+    gpu_name = 'Unknown GPU'
+  logger.info(f'Using GPU {GPU}: {gpu_name}')
+else:
+  device_string = 'cpu'
+  device = torch.device(device_string)
+  logger.info('Using CPU')
 
 # Compute time statistics
 mean_time_shift_src, std_time_shift_src, mean_time_shift_dst, std_time_shift_dst = \
@@ -163,6 +209,13 @@ for i in range(args.n_runs):
   criterion = torch.nn.BCELoss()
   optimizer = torch.optim.Adam(tgn.parameters(), lr=LEARNING_RATE)
   tgn = tgn.to(device)
+  
+  # Log model information
+  total_params = sum(p.numel() for p in tgn.parameters())
+  trainable_params = sum(p.numel() for p in tgn.parameters() if p.requires_grad)
+  logger.info(f'Total number of parameters: {total_params:,}')
+  logger.info(f'Number of trainable parameters: {trainable_params:,}')
+  logger.info(f'Model size: {total_params * 4 / 1024 / 1024:.2f} MB (assuming float32)')
 
   num_instance = len(train_data.sources)
   num_batch = math.ceil(num_instance / BATCH_SIZE)
@@ -173,12 +226,16 @@ for i in range(args.n_runs):
 
   new_nodes_val_aps = []
   val_aps = []
+
+  val_mrrs = []                # <--- AJOUTER
+  new_nodes_val_mrrs = []      # <--- AJOUTER
+
   epoch_times = []
   total_epoch_times = []
   train_losses = []
 
   early_stopper = EarlyStopMonitor(max_round=args.patience)
-  for epoch in range(NUM_EPOCH):
+  for epoch in trange(NUM_EPOCH, desc="Epochs"):
     start_epoch = time.time()
     ### Training
 
@@ -191,7 +248,13 @@ for i in range(args.n_runs):
     m_loss = []
 
     logger.info('start {} epoch'.format(epoch))
-    for k in range(0, num_batch, args.backprop_every):
+    # Progress bar for batches inside this epoch
+    batch_iter = range(0, num_batch, args.backprop_every)
+    try:
+      pb = tqdm(batch_iter, desc=f"Epoch {epoch} batches", leave=False)
+    except Exception:
+      pb = batch_iter
+    for k in pb:
       loss = 0
       optimizer.zero_grad()
 
@@ -227,6 +290,13 @@ for i in range(args.n_runs):
       loss.backward()
       optimizer.step()
       m_loss.append(loss.item())
+      # Update progress bar with the current mean loss when possible
+      try:
+        current_loss = np.mean(m_loss) if len(m_loss) > 0 else 0
+        if hasattr(pb, 'set_postfix'):
+          pb.set_postfix({'loss': f'{current_loss:.4f}'})
+      except Exception:
+        pass
 
       # Detach memory after 'args.backprop_every' number of batches so we don't backpropagate to
       # the start of time
@@ -245,7 +315,7 @@ for i in range(args.n_runs):
       # validation on unseen nodes
       train_memory_backup = tgn.memory.backup_memory()
 
-    val_ap, val_auc = eval_edge_prediction(model=tgn,
+    val_ap, val_auc, val_mmr = eval_edge_prediction(model=tgn,
                                                             negative_edge_sampler=val_rand_sampler,
                                                             data=val_data,
                                                             n_neighbors=NUM_NEIGHBORS)
@@ -257,7 +327,7 @@ for i in range(args.n_runs):
       tgn.memory.restore_memory(train_memory_backup)
 
     # Validate on unseen nodes
-    nn_val_ap, nn_val_auc = eval_edge_prediction(model=tgn,
+    nn_val_ap, nn_val_auc, nn_val_mmr = eval_edge_prediction(model=tgn,
                                                                         negative_edge_sampler=val_rand_sampler,
                                                                         data=new_node_val_data,
                                                                         n_neighbors=NUM_NEIGHBORS)
@@ -268,6 +338,8 @@ for i in range(args.n_runs):
 
     new_nodes_val_aps.append(nn_val_ap)
     val_aps.append(val_ap)
+    val_mrrs.append(val_mmr)   # <--- AJOUTER
+    new_nodes_val_mrrs.append(nn_val_mmr)             # <--- AJOUTER
     train_losses.append(np.mean(m_loss))
 
     # Save temporary results to disk
@@ -309,7 +381,7 @@ for i in range(args.n_runs):
 
   ### Test
   tgn.embedding_module.neighbor_finder = full_ngh_finder
-  test_ap, test_auc = eval_edge_prediction(model=tgn,
+  test_ap, test_auc, test_mmr = eval_edge_prediction(model=tgn,
                                                               negative_edge_sampler=test_rand_sampler,
                                                               data=test_data,
                                                               n_neighbors=NUM_NEIGHBORS)
@@ -318,7 +390,7 @@ for i in range(args.n_runs):
     tgn.memory.restore_memory(val_memory_backup)
 
   # Test on unseen nodes
-  nn_test_ap, nn_test_auc = eval_edge_prediction(model=tgn,
+  nn_test_ap, nn_test_auc, nn_test_mmr = eval_edge_prediction(model=tgn,
                                                                           negative_edge_sampler=nn_test_rand_sampler,
                                                                           data=new_node_test_data,
                                                                           n_neighbors=NUM_NEIGHBORS)
@@ -332,6 +404,8 @@ for i in range(args.n_runs):
     "val_aps": val_aps,
     "new_nodes_val_aps": new_nodes_val_aps,
     "test_ap": test_ap,
+    "test_mmr": test_mmr,               # <--- AJOUTER
+    "new_node_val_mrrs": new_nodes_val_mrrs,   # <
     "new_node_test_ap": nn_test_ap,
     "epoch_times": epoch_times,
     "train_losses": train_losses,

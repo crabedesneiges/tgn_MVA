@@ -53,7 +53,9 @@ class Memory(nn.Module):
     return self.memory.data.clone(), self.last_update.data.clone(), messages_clone
 
   def restore_memory(self, memory_backup):
-    self.memory.data, self.last_update.data = memory_backup[0].clone(), memory_backup[1].clone()
+    # Use Parameter.copy_ instead of directly assigning to .data
+    self.memory.copy_(memory_backup[0].clone())
+    self.last_update.copy_(memory_backup[1].clone())
 
     self.messages = defaultdict(list)
     for k, v in memory_backup[2].items():

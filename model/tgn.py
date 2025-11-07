@@ -64,7 +64,7 @@ class TGN(torch.nn.Module):
                            input_dimension=message_dimension,
                            message_dimension=message_dimension,
                            device=device)
-      self.message_aggregator = get_message_aggregator(aggregator_type=aggregator_type,
+      self.message_aggregator = get_message_aggregator(aggregator_type=aggregator_type,message_dim=message_dimension,
                                                        device=device)
       self.message_function = get_message_function(module_type=message_function,
                                                    raw_message_dimension=raw_message_dimension,

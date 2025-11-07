@@ -43,7 +43,7 @@ def eval_edge_prediction(model, negative_edge_sampler, data, n_neighbors, batch_
       val_ap.append(average_precision_score(true_label, pred_score))
       val_auc.append(roc_auc_score(true_label, pred_score))
 
-  return np.mean(val_ap), np.mean(val_auc)
+  return np.mean(val_ap), np.mean(val_auc), 0.0  # MRR placeholder
 
 
 def eval_node_classification(tgn, decoder, data, edge_idxs, batch_size, n_neighbors):
